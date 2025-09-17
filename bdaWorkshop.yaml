@@ -1,0 +1,411 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Bedrock Data Automation with Step Functions Distributed Map
+
+Parameters:
+  InputBucketName:
+    Type: String
+    Default: bda-input-bucket
+    Description: Name of the S3 bucket where input documents will be uploaded
+  OutputBucketName:
+    Type: String
+    Default: bda-output-bucket
+    Description: Name of the S3 bucket where processed results will be stored
+  CheckStatus:
+    Type: String
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Whether to check the status of the job before returning (true/false)
+  MaxStatusChecks:
+    Type: Number
+    Default: 10
+    Description: Maximum number of status checks to perform
+  StatusCheckInterval:
+    Type: Number
+    Default: 5
+    Description: Interval in seconds between status checks
+  LoggingBucketName:
+    Type: String
+    Default: bda-logging-bucket
+    Description: Name of the S3 bucket for access logs
+Resources: 
+  # S3 Logging Bucket
+  LoggingBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Join
+        - '-'
+        - - !Ref LoggingBucketName
+          - !Ref AWS::AccountId
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      ObjectLockEnabled: true
+
+  # Input Bucket with security configurations
+  InputBucket:
+    Type: AWS::S3::Bucket
+    DependsOn: LoggingBucket
+    Properties:
+      BucketName: !Join
+        - '-'
+        - - !Ref InputBucketName
+          - !Ref AWS::AccountId
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LoggingConfiguration:
+        DestinationBucketName: !Sub '${LoggingBucketName}-${AWS::AccountId}'
+        LogFilePrefix: input-bucket-logs/
+      ObjectLockEnabled: true     
+
+  # Output Bucket with security configurations
+  OutputBucket:
+    Type: AWS::S3::Bucket
+    DependsOn: LoggingBucket
+    Properties:
+      BucketName: !Join
+        - '-'
+        - - !Ref OutputBucketName
+          - !Ref AWS::AccountId
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LoggingConfiguration:
+        DestinationBucketName: !Sub '${LoggingBucketName}-${AWS::AccountId}'
+        LogFilePrefix: output-bucket-logs/
+      ObjectLockEnabled: true
+
+# Removed Dead Letter Queue due to permission issues
+
+  # KMS Key for Lambda environment variables
+  LambdaKmsKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: KMS key for Lambda environment variable encryption
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+
+  
+
+  # Results Processor Lambda Role with scoped permissions
+  ResultsProcessorLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  # Results Processor Lambda S3 Access Policy
+  ResultsProcessorLambdaS3AccessPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - s3:GetObject
+            Resource: !Sub 'arn:aws:s3:::${OutputBucketName}-${AWS::AccountId}/*'
+      Roles:
+        - !Ref ResultsProcessorLambdaRole
+
+  # Results Processor Lambda Bedrock Access Policy
+  ResultsProcessorLambdaBedrockAccessPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - bedrock:InvokeModel
+            Resource: 
+              - !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/anthropic.claude-3-sonnet-20240229-v1:0'
+      Roles:
+        - !Ref ResultsProcessorLambdaRole
+
+
+  # Results Processor Lambda Function with security configurations
+  ResultsProcessorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: bda-result-processor-function
+      CodeUri:
+        Bucket: ws-assets-prod-iad-r-pdx-f3b3f9f1a7d6a3d0
+        Key: 318b6bc5-b0cf-4b6e-b072-ba1c4d3234f9/results-processor.zip
+      Handler: app.lambda_handler
+      Runtime: python3.12
+      Timeout: 300
+      MemorySize: 256
+      Role: !GetAtt ResultsProcessorLambdaRole.Arn      
+      Environment:
+        Variables:
+          MODEL_ID: anthropic.claude-3-sonnet-20240229-v1:0
+          OUTPUT_BUCKET: !Sub '${OutputBucketName}-${AWS::AccountId}'
+      KmsKeyArn: !GetAtt LambdaKmsKey.Arn
+
+  # Step Functions Role with scoped permissions
+  StepFunctionsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+
+  # Step Functions Lambda Invoke Policy
+  StepFunctionsLambdaInvokePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - lambda:InvokeFunction
+            Resource:
+              - !GetAtt ResultsProcessorFunction.Arn
+              - !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:bda-processor-function'
+              - !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:bda-*'
+      Roles:
+        - !Ref StepFunctionsRole
+
+  # Step Functions S3 List Access Policy
+  StepFunctionsS3ListAccessPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - s3:*
+            Resource: 
+              - !Sub 'arn:aws:s3:::${InputBucketName}-${AWS::AccountId}'
+              - !Sub 'arn:aws:s3:::${InputBucketName}-${AWS::AccountId}/*'
+              - !Sub 'arn:aws:s3:::${OutputBucketName}-${AWS::AccountId}'
+              - !Sub 'arn:aws:s3:::${OutputBucketName}-${AWS::AccountId}/*'
+      Roles:
+        - !Ref StepFunctionsRole
+
+  # Step Functions Distributed Map Access Policy
+  StepFunctionsDistributedMapAccessPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - states:StartExecution
+              - states:DescribeExecution
+            Resource: 
+              - !Sub 'arn:aws:states:${AWS::Region}:${AWS::AccountId}:execution:*:*'
+              - !Sub 'arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:*'
+      Roles:
+        - !Ref StepFunctionsRole
+
+  # Step Functions Bedrock Data Automation Access Policy
+  StepFunctionsBedrockDataAutomationAccessPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - bedrock:InvokeModel
+              - bedrock:InvokeDataAutomationAsync
+              - bedrock:UpdateDataAutomationProject
+              - bedrock:GetDataAutomationStatus
+              - bedrock:GetDataAutomationProject
+              - bedrock:ListDataAutomationProjects
+              - bedrock:CreateDataAutomationProject
+            Resource: "*"
+      Roles:
+        - !Ref StepFunctionsRole
+        
+  # Custom Resource Lambda S3 Access Policy
+  CustomResourceLambdaS3AccessPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:HeadObject
+              - s3:ListBucket
+            Resource:
+              - 'arn:aws:s3:::ws-assets-prod-iad-r-pdx-f3b3f9f1a7d6a3d0/*'
+              - 'arn:aws:s3:::ws-assets-prod-iad-r-pdx-f3b3f9f1a7d6a3d0'
+          - Effect: Allow
+            Action:
+              - s3:CopyObject
+              - s3:PutObject
+              - s3:GetObject
+              - s3:ListBucket
+            Resource:
+              - !Sub 'arn:aws:s3:::${InputBucketName}-${AWS::AccountId}/*'
+              - !Sub 'arn:aws:s3:::${InputBucketName}-${AWS::AccountId}'
+
+  CustomResourceLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - !Ref CustomResourceLambdaS3AccessPolicy
+
+  CustomResourceLambdaFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      InlineCode: |
+        import boto3
+        import json
+        import urllib.request
+        import os
+
+        s3 = boto3.client('s3')
+
+        def send_response(event, context, response_status, reason=None, response_data=None, physical_resource_id=None):
+            response_body = json.dumps({
+                'Status': response_status,
+                'Reason': reason or "See the details in CloudWatch Log Stream: " + context.log_stream_name,
+                'PhysicalResourceId': physical_resource_id or context.log_stream_name,
+                'StackId': event['StackId'],
+                'RequestId': event['RequestId'],
+                'LogicalResourceId': event['LogicalResourceId'],
+                'Data': response_data or {}
+            })
+            req = urllib.request.Request(
+                url=event['ResponseURL'],
+                data=response_body.encode('utf-8'),
+                headers={
+                    'Content-Length': str(len(response_body)),
+                    'Content-Type': 'application/json'
+                },
+                method='PUT'
+            )
+            try:
+                with urllib.request.urlopen(req) as response:
+                    print(f"Status code: {response.getcode()}")
+                    print(f"Status message: {response.msg}")
+            except Exception as e:
+                print(f"Failed to send response: {str(e)}")
+
+        def lambda_handler(event, context):
+            try:
+                if event['RequestType'] in ['Create', 'Update']:
+                    source_bucket = event['ResourceProperties']['SourceBucket']
+                    destination_bucket = event['ResourceProperties']['DestinationBucket']
+                    source_keys = event['ResourceProperties']['SourceKeys']
+                    destination_prefix = event['ResourceProperties'].get('DestinationPrefix', '')
+                    copied_files = []
+                    for source_key in source_keys:
+                        destination_key = os.path.join(destination_prefix, os.path.basename(source_key))
+                        copy_source = {'Bucket': source_bucket, 'Key': source_key}
+                        s3.copy_object(CopySource=copy_source, Bucket=destination_bucket, Key=destination_key)
+                        copied_files.append(f"{source_key} as {destination_key}")
+                    message = f'Files copied from {source_bucket} to {destination_bucket}: {", ".join(copied_files)}'
+                    send_response(event, context, 'SUCCESS', reason=message)
+                elif event['RequestType'] == 'Delete':
+                    send_response(event, context, 'SUCCESS', reason='Delete request acknowledged')
+            except Exception as e:
+                send_response(event, context, 'FAILED', reason=str(e))
+      Handler: index.lambda_handler
+      Runtime: python3.9
+      Role: !GetAtt CustomResourceLambdaRole.Arn
+      Timeout: 300
+
+  CustomS3InputFileMover:
+    DependsOn: [InputBucket, CustomResourceLambdaFunction]
+    Type: Custom::S3FileMover
+    Properties:
+      ServiceToken: !GetAtt CustomResourceLambdaFunction.Arn
+      SourceBucket: ws-assets-prod-iad-r-pdx-f3b3f9f1a7d6a3d0
+      SourceKeys:
+        - 318b6bc5-b0cf-4b6e-b072-ba1c4d3234f9/InputFiles/2022-Amazon-Shareholder-Letter.pdf
+        - 318b6bc5-b0cf-4b6e-b072-ba1c4d3234f9/InputFiles/2023-Amazon-Shareholder-Letter.pdf
+        - 318b6bc5-b0cf-4b6e-b072-ba1c4d3234f9/InputFiles/2024-Amazon-Shareholder-Letter.pdf        
+      DestinationBucket: !Sub '${InputBucketName}-${AWS::AccountId}'      
+
+  CustomS3BlueprintFileMover:
+    DependsOn: [InputBucket, CustomResourceLambdaFunction]
+    Type: Custom::S3FileMover
+    Properties:
+      ServiceToken: !GetAtt CustomResourceLambdaFunction.Arn
+      SourceBucket: ws-assets-prod-iad-r-pdx-f3b3f9f1a7d6a3d0
+      SourceKeys:        
+        - 318b6bc5-b0cf-4b6e-b072-ba1c4d3234f9/blueprint/2021-Amazon-Shareholder-Letter.pdf
+      DestinationBucket: !Sub '${InputBucketName}-${AWS::AccountId}'
+      DestinationPrefix: blueprint
+Outputs:
+  InputBucketName:
+    Description: Name of the input S3 bucket
+    Value: !Ref InputBucket
+  OutputBucketName:
+    Description: Name of the output S3 bucket
+    Value: !Ref OutputBucket
+  LoggingBucketName:
+    Description: Name of the logging S3 bucket
+    Value: !Ref LoggingBucket
